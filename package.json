@@ -1,0 +1,11 @@
+{
+  "name": "g-lib",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.js --bundle=false --minify --outfile=index.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
