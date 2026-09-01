@@ -1,6 +1,6 @@
 {
   "name": "g-lib",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "build": "esbuild src/index.js --bundle=false --minify --outfile=index.js"
