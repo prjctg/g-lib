@@ -3,7 +3,7 @@
  *
  * Import in any animation module:
  *   import { createPool, textLayout, createPhysics, beatPulse }
- *     from 'https://cdn.jsdelivr.net/gh/prjctg/g-lib@1/index.js';
+ *     from 'https://cdn.jsdelivr.net/gh/prjctg/g-lib@1.2.0/index.js';
  */
 
 // ── Object Pool ───────────────────────────────────────────────────────────────
@@ -913,8 +913,11 @@ function range(a, b) {
  *
  * @param {HTMLCanvasElement} canvas  Its `width`/`height` are set when they change,
  *   which also CLEARS it — so treat a `changed` result as "rebuild and repaint".
- * @param {{ maxDpr?: number, minSize?: number }} [opts]
+ * @param {{ maxDpr?: number, minSize?: number, maxPixels?: number }} [opts]
  *   `minSize` (1) — return null below this, for a container not laid out yet.
+ *   `maxPixels` (Infinity) — backing-store pixel budget (`bw * bh`). When the
+ *   dpr-scaled store would exceed it, `dpr` is lowered (never below 1) until it
+ *   fits; the CSS size `w`/`h` is unchanged, so layout maths stays in CSS pixels.
  * @returns {{ w, h, dpr, changed } | null}  `w`/`h` are CSS pixels.
  *
  * @example
@@ -927,15 +930,18 @@ function range(a, b) {
  * }
  * G.on(G.TYPE.RESIZE, () => { if (ensureSized()) render(); });
  */
-export function fitCanvas(G, canvas, { maxDpr = 2, minSize = 1 } = {}) {
+export function fitCanvas(G, canvas, { maxDpr = 2, minSize = 1, maxPixels = Infinity } = {}) {
   const rect = G.clientRect();
   const w = Math.max(1, Math.round(rect.width));
   const h = Math.max(1, Math.round(rect.height));
   if (w < minSize || h < minSize) return null;
-  const dpr = Math.min(
+  let dpr = Math.min(
     maxDpr,
     (typeof devicePixelRatio === 'number' && devicePixelRatio) || 1,
   );
+  if (w * h * dpr * dpr > maxPixels) {
+    dpr = Math.max(1, Math.sqrt(maxPixels / (w * h)));
+  }
   const bw = Math.round(w * dpr);
   const bh = Math.round(h * dpr);
   const changed = canvas.width !== bw || canvas.height !== bh;
@@ -1026,3 +1032,353 @@ export function cssColors(el, spec, probeCtx) {
   };
   return { rgb, read };
 }
+
+// ── Math prelude ──────────────────────────────────────────────────────────────
+// Pure, DOM-free, and importable at module scope — so unit tests in node can use
+// them, which `G` (only alive inside the default function) cannot offer.
+
+/**
+ * num(v, d, lo?, hi?) — a finite number from `v`, else the fallback `d`.
+ * Accepts numeric strings (config values arrive stringly); an empty string is
+ * not a number. With `lo`/`hi` the result is clamped — the fallback `d` is
+ * returned as-is, unclamped.
+ */
+export function num(v, d, lo = -Infinity, hi = Infinity) {
+  const x = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
+  return typeof x === 'number' && Number.isFinite(x) ? Math.min(Math.max(x, lo), hi) : d;
+}
+
+/**
+ * clamp(v, lo, hi) — bit-compatible with the legacy `G.clamp`. When `lo > hi`
+ * the result is `lo` (the max is applied last), not an exception.
+ */
+export const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+/** lerp(a, b, t) — unclamped linear interpolation. */
+export const lerp = (a, b, t) => a + (b - a) * t;
+
+/**
+ * prog(t, a, b) — 0..1 progress of `t` through [a, b]. A zero or negative span
+ * is a step: 0 before `b`, 1 from `b` on.
+ */
+export const prog = (t, a, b) => (b > a ? clamp((t - a) / (b - a), 0, 1) : t >= b ? 1 : 0);
+
+/** smooth(t) — cubic smoothstep, input clamped to 0..1. */
+export const smooth = (t) => {
+  t = clamp(t, 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+/** smoother(t) — quintic smootherstep (zero 1st and 2nd derivative at both ends). */
+export const smoother = (t) => {
+  t = clamp(t, 0, 1);
+  return t * t * t * (t * (t * 6 - 15) + 10);
+};
+
+/** easeOutExpo(t) — fast start, long tail. Exactly 0 at 0 and 1 at 1. */
+export const easeOutExpo = (t) => {
+  t = clamp(t, 0, 1);
+  return t >= 1 ? 1 : 1 - Math.pow(2, -10 * t);
+};
+
+/** easeInExpo(t) — long wind-up, fast finish. Exactly 0 at 0 and 1 at 1. */
+export const easeInExpo = (t) => {
+  t = clamp(t, 0, 1);
+  return t <= 0 ? 0 : Math.pow(2, 10 * t - 10);
+};
+
+/** easeOutBounce(t) — the classic four-segment bounce, landing exactly on 1. */
+export const easeOutBounce = (t) => {
+  t = clamp(t, 0, 1);
+  const n = 7.5625;
+  const d = 2.75;
+  if (t < 1 / d) return n * t * t;
+  if (t < 2 / d) return n * (t -= 1.5 / d) * t + 0.75;
+  if (t < 2.5 / d) return n * (t -= 2.25 / d) * t + 0.9375;
+  return n * (t -= 2.625 / d) * t + 0.984375;
+};
+
+/**
+ * ease(t, type = 'inOut') — one entry point for the ease family.
+ *
+ * `'in' | 'out' | 'inOut' | 'cubic'` are bit-compatible with the legacy
+ * `G.ease` (so `'inOut'` is the QUAD in-out and `'cubic'` the cubic in-out).
+ * Added: `'smooth'`, `'smoother'`, `'expoIn'`, `'expoOut'`, `'bounceOut'`.
+ * An unknown type falls back to `'inOut'`, as `G.ease` does.
+ */
+export function ease(t, type = 'inOut') {
+  t = clamp(t, 0, 1);
+  switch (type) {
+    case 'in': return t * t;
+    case 'out': return t * (2 - t);
+    case 'cubic': return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    case 'smooth': return smooth(t);
+    case 'smoother': return smoother(t);
+    case 'expoIn': return easeInExpo(t);
+    case 'expoOut': return easeOutExpo(t);
+    case 'bounceOut': return easeOutBounce(t);
+    default: return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+  }
+}
+
+// ── Random & hashing ──────────────────────────────────────────────────────────
+
+/**
+ * mulberry32(seed) — seeded PRNG returning floats in [0, 1). Identical to the
+ * eight hand-rolled copies it replaces, so a seed gives the same stream.
+ */
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * xorshift32(seed = 1) — the pure twin of the legacy `G.randGen`: the same
+ * stream for the same seed. Note a seed of 0 is a fixed point (always 0); pass
+ * a non-zero seed, as `G.randGen` callers must.
+ */
+export function xorshift32(seed = 1) {
+  let s = seed | 0;
+  return () => {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return (s >>> 0) / 0x100000000;
+  };
+}
+
+/**
+ * hash32(...ints) — mixes any number of integers into one well-distributed
+ * uint32. Pure function of its arguments, so a seek replays identically.
+ *
+ * NOTE: the modules' local hashes use several different constants; this is the
+ * `mercury-type` form. It is NOT value-compatible with the others — migrate a
+ * module only if its output may change, or keep its local hash.
+ */
+export function hash32(...xs) {
+  let h = 0x9e3779b9;
+  for (const x of xs) {
+    h = Math.imul(h ^ (x | 0), 0x85ebca6b);
+    h ^= h >>> 13;
+    h = Math.imul(h, 0xc2b2ae35);
+    h ^= h >>> 16;
+  }
+  return h >>> 0;
+}
+
+/** hash01(...ints) — `hash32` scaled into [0, 1). */
+export const hash01 = (...xs) => hash32(...xs) / 4294967296;
+
+// ── Colour ────────────────────────────────────────────────────────────────────
+
+/**
+ * parseHex(h) — `#rgb` / `#rrggbb` (the `#` optional; anything past 6 digits is
+ * ignored) to `[r, g, b]` bytes. Anything unparseable is mid-grey `[128,128,128]`.
+ */
+export function parseHex(h) {
+  let s = String(h).trim().replace('#', '');
+  if (s.length === 3) s = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
+  const n = parseInt(s.slice(0, 6), 16);
+  if (!Number.isFinite(n) || s.length < 6) return [128, 128, 128];
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+/** luminance([r, g, b]) — WCAG relative luminance, 0..1, from 0..255 channels. */
+export function luminance(c) {
+  const f = (v) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2]);
+}
+
+/** contrast(a, b) — WCAG contrast ratio of two `[r, g, b]` colours, 1..21. */
+export function contrast(a, b) {
+  const la = luminance(a);
+  const lb = luminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+// ── Time & text ───────────────────────────────────────────────────────────────
+
+/**
+ * lastAtOrBefore(arr, t, key?) — index of the LAST element whose value (or
+ * `element[key]`) is `<= t` in an array sorted ascending; -1 if none. Binary
+ * search, so it is the right way to ask "which word is on screen at `t`" after
+ * a seek.
+ */
+export function lastAtOrBefore(arr, t, key) {
+  let lo = 0;
+  let hi = arr.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const v = key ? arr[mid][key] : arr[mid];
+    if (v <= t) {
+      ans = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return ans;
+}
+
+/** applyCase(text, mode) — `'upper'` / `'lower'`; any other mode leaves text as is. */
+export function applyCase(text, mode) {
+  if (mode === 'upper') return text.toUpperCase();
+  if (mode === 'lower') return text.toLowerCase();
+  return text;
+}
+
+/**
+ * groupWords(syls) — fold a flat syllable list into words. A word is a run of
+ * syllables sharing `wordId` AND `lineId`; spacer syllables (`isSP`) are
+ * skipped. Each word is `{ wordId, lineId, s, e, text, syls, index }`, where
+ * `s`/`e` span its syllables and `text` is their `d` concatenated.
+ */
+export function groupWords(syls) {
+  const out = [];
+  let cur = null;
+  (syls || []).forEach((syl) => {
+    if (!syl || syl.isSP) return;
+    if (!cur || cur.wordId !== syl.wordId || cur.lineId !== syl.lineId) {
+      cur = { wordId: syl.wordId, lineId: syl.lineId, s: syl.s, e: syl.e, text: '', syls: [], index: out.length };
+      out.push(cur);
+    }
+    cur.syls.push(syl);
+    cur.text += syl.d || '';
+    if (syl.s < cur.s) cur.s = syl.s;
+    if (syl.e > cur.e) cur.e = syl.e;
+  });
+  return out;
+}
+
+/**
+ * measure(ctx, text, size, opts?) — canvas text metrics with sane fallbacks:
+ * `{ width, ascent, descent }` in the same px as `size`.
+ *
+ * Canonical choice among the ~10 copies that existed. They differed in (a) the
+ * fallback ratios (0.70–0.76 ascent, 0.20–0.25 descent), (b) whether a reported
+ * 0 counts as missing (`||`) or only NaN/undefined does, and (c) whether the
+ * font was set inside. Decisions:
+ *  - `ascent` falls back when missing, non-finite OR 0 — a 0 ascent is a metrics
+ *    failure for any non-empty text, and 0 collapses a layout box;
+ *  - `descent` falls back only when missing/non-finite/negative — 0 is a real
+ *    answer for text without descenders ("ox");
+ *  - defaults 0.75 / 0.25 (the median), overridable per call.
+ * Set `opts.font` to have it assigned to `ctx.font` first; omit it when the
+ * caller has already set the font.
+ *
+ * @param {{ font?: string, ascent?: number, descent?: number }} [opts]
+ */
+export function measure(ctx, text, size, { font, ascent = 0.75, descent = 0.25 } = {}) {
+  if (font) ctx.font = font;
+  const m = ctx.measureText(text);
+  const a = m.actualBoundingBoxAscent;
+  const d = m.actualBoundingBoxDescent;
+  return {
+    width: m.width,
+    ascent: Number.isFinite(a) && a > 0 ? a : size * ascent,
+    descent: Number.isFinite(d) && d >= 0 ? d : size * descent,
+  };
+}
+
+/**
+ * rasterizeGlyph(ctx, text, fontFamily, opts?) — draw `text` centred and
+ * scaled to fill a square coverage canvas, and return its RGBA bytes (or `null`
+ * for empty text). `ctx` must be a `size × size` 2D context (use
+ * `G.context2d(size, size, 1, { willReadFrequently: true })`).
+ *
+ * @param {{ size?: number, padding?: number, weight?: number|string }} [opts]
+ *   `size` (100) — canvas edge; `padding` (0.82) — the glyph occupies at most
+ *   this fraction of the edge; `weight` (700).
+ */
+export function rasterizeGlyph(ctx, text, fontFamily, { size = 100, padding = 0.82, weight = 700 } = {}) {
+  ctx.clearRect(0, 0, size, size);
+  if (!text) return null;
+  const REF = 100;
+  ctx.font = `${weight} ${REF}px ${fontFamily}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  let m = ctx.measureText(text);
+  const refW = m.width;
+  const refH = (m.actualBoundingBoxAscent || REF * 0.7) + (m.actualBoundingBoxDescent || REF * 0.2);
+  const maxDim = size * padding;
+  const scale = Math.min(maxDim / Math.max(refW, 1), maxDim / Math.max(refH, 1));
+  const fontSize = Math.max(4, REF * scale);
+  ctx.font = `${weight} ${fontSize}px ${fontFamily}`;
+  m = ctx.measureText(text);
+  const asc = m.actualBoundingBoxAscent || fontSize * 0.7;
+  const desc = m.actualBoundingBoxDescent || fontSize * 0.2;
+  ctx.fillStyle = '#fff';
+  ctx.fillText(text, size / 2, size / 2 + (asc - desc) / 2);
+  return ctx.getImageData(0, 0, size, size).data;
+}
+
+/**
+ * sampleCoverage(data, cx, cy, opts?) — fraction (0..1) of a small disc around
+ * (cx, cy) that lies inside the glyph drawn by `rasterizeGlyph`.
+ *
+ * @param {{ size?: number, radius?: number, steps?: number, alpha?: number }} [opts]
+ *   `size` (100) must match the raster; `radius` (2.6) is the disc radius in
+ *   raster px; `steps` (5) the sub-grid resolution; `alpha` (96) the 0..255
+ *   alpha above which a pixel counts as inside.
+ */
+export function sampleCoverage(data, cx, cy, { size = 100, radius = 2.6, steps = 5, alpha = 96 } = {}) {
+  let hit = 0;
+  let total = 0;
+  const step = (2 * radius) / steps;
+  for (let oy = -radius; oy <= radius; oy += step) {
+    for (let ox = -radius; ox <= radius; ox += step) {
+      if (ox * ox + oy * oy > radius * radius) continue;
+      const px = Math.round(cx + ox);
+      const py = Math.round(cy + oy);
+      if (px < 0 || px >= size || py < 0 || py >= size) continue;
+      total++;
+      if (data[(py * size + px) * 4 + 3] > alpha) hit++;
+    }
+  }
+  return total ? hit / total : 0;
+}
+
+// ── Spring ────────────────────────────────────────────────────────────────────
+
+/**
+ * springAt(ms, zeta, wn) — step response of a damped spring, 0 at the trigger
+ * heading to 1 (damping ratio `zeta`, natural frequency `wn` rad/s). A closed
+ * form of three branches (under/critical/over-damped), so it is a pure function
+ * of time and a seek is exact. `ms <= 0` is 0.
+ */
+export function springAt(ms, zeta, wn) {
+  if (!(ms > 0)) return 0;
+  const t = ms / 1000;
+  if (Math.abs(zeta - 1) < 1e-4) return 1 - Math.exp(-wn * t) * (1 + wn * t);
+  if (zeta < 1) {
+    const a = zeta * wn;
+    const wd = wn * Math.sqrt(1 - zeta * zeta);
+    return 1 - Math.exp(-a * t) * (Math.cos(wd * t) + (a / wd) * Math.sin(wd * t));
+  }
+  const q = wn * Math.sqrt(zeta * zeta - 1);
+  const r1 = -zeta * wn + q;
+  const r2 = -zeta * wn - q;
+  return 1 - (r2 * Math.exp(r1 * t) - r1 * Math.exp(r2 * t)) / (r2 - r1);
+}
+
+/**
+ * makeSpring(zeta, wn, eps = 2e-4) — a preset `{ z, wn, hz }` with an exact
+ * horizon `hz` (ms) past which `spr` returns exactly 1, where the closed-form
+ * envelope falls below `eps`.
+ */
+export function makeSpring(zeta, wn, eps = 2e-4) {
+  const a = Math.min(zeta, 1) * wn;
+  const k = zeta < 1 ? 1 / Math.sqrt(1 - zeta * zeta) : 1 + wn;
+  return { z: zeta, wn, hz: (Math.log(k / eps) / a) * 1000 };
+}
+
+/** spr(ms, preset) — `springAt` for a `makeSpring` preset, exactly 1 past its horizon. */
+export const spr = (ms, S) => (!(ms > 0) ? 0 : ms >= S.hz ? 1 : springAt(ms, S.z, S.wn));
