@@ -9,7 +9,7 @@ import { createPool, textLayout, createPhysics, beatPulse }
   from 'https://cdn.jsdelivr.net/gh/prjctg/g-lib@1/index.js';
 ```
 
-Pin to a specific tag (`@1`, `@1.1.0`) — never import from `@main`.
+Pin to an exact tag (`@1.2.0`) — never import from `@main`, and not a floating `@1`/`@1.2` either (a helper added later may be missing from the copy you resolve).
 
 > **Testing a module that imports this.** Node's ESM loader rejects `https:`
 > specifiers, so an anim module's unit test cannot import its shipped JS as-is.
@@ -324,9 +324,79 @@ place rather than painting whatever was there before.
 
 ---
 
+### `fitCanvas` pixel budget (1.2.0)
+
+`fitCanvas(G, canvas, { maxPixels })` lowers `dpr` (never below 1) until
+`bw * bh <= maxPixels`. `w`/`h` stay CSS pixels, so layout maths is unaffected.
+`maxPixels` defaults to `Infinity`, so 1.1.0 callers are unchanged.
+
+## Math prelude (1.2.0)
+
+Pure and DOM-free, so they work at module scope and in node unit tests, which the
+runtime-only `G` cannot (`G` exists only inside a module's default function).
+The legacy `G.clamp/lerp/ease/randGen` are frozen; these are their successors and
+are **bit-compatible** where noted (tests assert it).
+
+| Export | Notes |
+| --- | --- |
+| `num(v, d, lo?, hi?)` | finite number (numeric strings accepted) else `d`; optional clamp |
+| `clamp(v, lo, hi)` | identical to `G.clamp`; `lo > hi` returns `lo` |
+| `lerp(a, b, t)` | unclamped |
+| `prog(t, a, b)` | 0..1 progress through `[a, b]`; zero span is a step at `b` |
+| `smooth(t)`, `smoother(t)` | cubic / quintic smoothstep, input clamped |
+| `easeOutExpo`, `easeInExpo`, `easeOutBounce` | exact 0 and 1 at the ends |
+| `ease(t, type = 'inOut')` | `in`/`out`/`inOut`/`cubic` identical to `G.ease`; adds `smooth`, `smoother`, `expoIn`, `expoOut`, `bounceOut` |
+| `mulberry32(seed)` | same stream as the 8 hand-rolled copies |
+| `xorshift32(seed = 1)` | same stream as `G.randGen`; seed 0 is a fixed point |
+| `hash32(...ints)`, `hash01(...ints)` | uint32 / [0,1). **Not** value-compatible with modules' other local hashes — see below |
+
+> **`hash32` caveat.** The modules carry at least four different hash constants.
+> `hash32` is the `mercury-type` form. A module whose output is seeded by its own
+> hash will change look if swapped, so migrate only where that is acceptable.
+
+## Colour & time (1.2.0)
+
+- `parseHex(h)` — `#rgb`/`#rrggbb` to `[r,g,b]`; unparseable gives `[128,128,128]`.
+- `luminance([r,g,b])`, `contrast(a, b)` — WCAG relative luminance and contrast ratio (1..21).
+- `lastAtOrBefore(arr, t, key?)` — binary search, last index with value `<= t`, else `-1`.
+- `applyCase(text, 'upper' | 'lower')` — anything else returns the text unchanged.
+- `groupWords(syls)` — words as `{ wordId, lineId, s, e, text, syls, index }`; skips `isSP`.
+- `springAt(ms, zeta, wn)`, `makeSpring(zeta, wn, eps?)`, `spr(ms, preset)` — closed-form damped spring; `spr` is exactly `1` past the preset's horizon `hz`, so it ends cleanly and a seek is exact.
+
+## Text metrics (1.2.0)
+
+### `measure(ctx, text, size, opts?)`
+
+Returns `{ width, ascent, descent }` from a 2D context. `opts`: `font` (assigned to
+`ctx.font` first; omit if already set), `ascent` / `descent` (fallback ratios of
+`size`, default `0.75` / `0.25`).
+
+About ten local copies existed and they differed in three ways. The canonical choice:
+
+1. **Fallback ratios** were 0.70–0.76 (ascent) and 0.20–0.25 (descent) → median
+   `0.75` / `0.25`, overridable. A module that needs its old numbers passes them.
+2. **Missing vs zero.** Most copies used `||`, so a real `0` descent (`"ox"`, no
+   descenders) was replaced by a fallback and the box grew. Ascent `0` is a
+   metrics failure for any non-empty text, so it falls back; descent `0` is a real
+   answer, so it does not. Only non-finite or negative descent falls back.
+3. **Who sets the font.** Optional via `opts.font`.
+
+Not folded in (different contracts, keep local): `einstein-ring` (normalised by
+100 and memoised), `manga-panel-*` (adds halo and ink overhang), `mograph-voxel` /
+`truchet-type` (cell-grid ink bounds), and `G.measureText`-based wrappers.
+
+### `rasterizeGlyph(ctx, text, fontFamily, opts?)` / `sampleCoverage(data, cx, cy, opts?)`
+
+`rasterizeGlyph` fits `text` to a square `size × size` context (default 100,
+`padding` 0.82, `weight` 700) and returns the RGBA bytes, or `null` for empty
+text. `sampleCoverage` averages a disc of `radius` (2.6) around a point: `steps`
+(5), `alpha` threshold (96), `size` must match. Defaults reproduce
+`circle-wipe`/`halftone-triangles`/`honeycomb-wipe`; `ripple-rings` uses
+`padding: 0.8, radius: 2.4`.
+
 ## Versioning
 
 Tag releases as `v1.0.0`, `v1.1.0`, etc. jsDelivr serves the latest within a major via `@1`.
 
-Run `npm run build` after editing `src/index.js` — `index.js` is the generated,
+Run `npm test` (node's built-in runner, no extra dependency) and `npm run build` after editing `src/index.js` — `index.js` is the generated,
 minified bundle jsDelivr actually serves, and is never hand-edited.
