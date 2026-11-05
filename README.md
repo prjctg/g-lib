@@ -394,6 +394,19 @@ text. `sampleCoverage` averages a disc of `radius` (2.6) around a point: `steps`
 `circle-wipe`/`halftone-triangles`/`honeycomb-wipe`; `ripple-rings` uses
 `padding: 0.8, radius: 2.4`.
 
+## three.js & face-api setup (1.3.0)
+
+g-lib never imports three.js: pass in the `THREE` namespace the module imported (version chosen from prjctg-ui's `anims/cdnPins.json`).
+
+### `createThreeStage(THREE, G, opts?)`
+Renderer + camera + scene sized to `G.clientRect()`, pixel ratio clamped to `maxDpr` (default 2). Options: `canvas`, `alpha` (true), `antialias` (true), `maxDpr`, `fov` (55), `near`, `far`, `renderer` (extra `WebGLRenderer` params). Returns `{ renderer, camera, scene, resize, render, dispose }`; `resize()` returns `{ w, h, dpr }` or `null` while the container has no size. `dispose()` frees every geometry/material/texture in the scene, the renderer and the GL context, and detaches a canvas it created. Wire it to `G.TYPE.UNINIT`.
+
+### `disposeObject3D(root)`
+Frees geometries, materials and the textures they hold. Idempotent; accepts `null`.
+
+### `loadFaceApi({ base?, nets? })` / `tinyFaceOptions(faceapi, inputSize?, scoreThreshold?)` / `FACE_API_BASE`
+Dynamic-imports `@vladmandic/face-api` (pinned in `FACE_API_BASE`), loads the tiny detector and tiny 68-point landmark nets once per page and returns `faceapi`. A failed load is evicted so the next call retries. Keep your own try/catch and fallback.
+
 ## Versioning
 
 Tag releases as `v1.0.0`, `v1.1.0`, etc. jsDelivr serves the latest within a major via `@1`.

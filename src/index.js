@@ -3,7 +3,7 @@
  *
  * Import in any animation module:
  *   import { createPool, textLayout, createPhysics, beatPulse }
- *     from 'https://cdn.jsdelivr.net/gh/prjctg/g-lib@1.2.0/index.js';
+ *     from 'https://cdn.jsdelivr.net/gh/prjctg/g-lib@1.3.0/index.js';
  */
 
 // ── Object Pool ───────────────────────────────────────────────────────────────
@@ -1382,3 +1382,152 @@ export function makeSpring(zeta, wn, eps = 2e-4) {
 
 /** spr(ms, preset) — `springAt` for a `makeSpring` preset, exactly 1 past its horizon. */
 export const spr = (ms, S) => (!(ms > 0) ? 0 : ms >= S.hz ? 1 : springAt(ms, S.z, S.wn));
+
+// ── three.js / face-api shared setup (1.3.0) ─────────────────────────────────
+// g-lib never imports three.js itself: the module passes in the `THREE`
+// namespace it already imported (from the version in prjctg-ui's central pin
+// list, anims/cdnPins.json), so g-lib stays version-agnostic and node-testable.
+
+/**
+ * disposeObject3D(root) — free GPU resources of an object tree.
+ *
+ * Disposes every geometry, material and every texture held in a material
+ * property (`map`, `normalMap`, uniforms of ShaderMaterial, ...). Safe to call
+ * on shared resources twice (three.js dispose is idempotent) and on `null`.
+ * Does NOT dispose the renderer; see `createThreeStage().dispose()`.
+ */
+export function disposeObject3D(root) {
+  if (!root) return;
+  const seen = new Set();
+  const freeMaterial = (m) => {
+    if (!m || seen.has(m)) return;
+    seen.add(m);
+    for (const v of Object.values(m)) {
+      if (v && v.isTexture) v.dispose();
+      else if (v && typeof v === 'object' && v.value && v.value.isTexture) v.value.dispose();
+    }
+    if (m.uniforms) {
+      for (const u of Object.values(m.uniforms)) {
+        if (u && u.value && u.value.isTexture) u.value.dispose();
+      }
+    }
+    if (typeof m.dispose === 'function') m.dispose();
+  };
+  const visit = (o) => {
+    if (o.geometry && typeof o.geometry.dispose === 'function') o.geometry.dispose();
+    if (Array.isArray(o.material)) o.material.forEach(freeMaterial);
+    else freeMaterial(o.material);
+  };
+  if (typeof root.traverse === 'function') root.traverse(visit);
+  else visit(root);
+}
+
+/**
+ * createThreeStage(THREE, G, opts?) — the renderer + camera + scene setup that
+ * every WebGL module repeats.
+ *
+ * Creates a `WebGLRenderer` (appended to `G.root` unless `canvas` is given),
+ * a `PerspectiveCamera` and a `Scene`, sized to `G.clientRect()` with the
+ * pixel ratio clamped to `maxDpr`.
+ *
+ * @param {object} THREE  The three.js namespace the module imported.
+ * @param {object} G      The G API (`clientRect`, and `root` when no `canvas`).
+ * @param {object} [opts]
+ * @param {HTMLCanvasElement} [opts.canvas]  Render into this canvas instead of creating one.
+ * @param {boolean} [opts.alpha=true]
+ * @param {boolean} [opts.antialias=true]
+ * @param {number} [opts.maxDpr=2]
+ * @param {number} [opts.fov=55]
+ * @param {number} [opts.near=0.1]
+ * @param {number} [opts.far=1000]
+ * @param {object} [opts.renderer]  Extra WebGLRenderer parameters.
+ * @returns {{ renderer, camera, scene, resize, render, dispose }}
+ *   `resize()` refits to the current client rect and returns `{ w, h, dpr }`
+ *   (or `null` while the container has no size). `render()` draws one frame.
+ *   `dispose()` frees scene resources, the renderer and the GL context, and
+ *   detaches a canvas it created; calling it twice is harmless.
+ */
+export function createThreeStage(
+  THREE,
+  G,
+  { canvas, alpha = true, antialias = true, maxDpr = 2, fov = 55, near = 0.1, far = 1000, renderer: rendererOpts } = {},
+) {
+  const renderer = new THREE.WebGLRenderer({ ...(canvas ? { canvas } : {}), alpha, antialias, ...rendererOpts });
+  const ownsCanvas = !canvas;
+  if (ownsCanvas && G.root && typeof G.root.appendChild === 'function') G.root.appendChild(renderer.domElement);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(fov, 1, near, far);
+  let disposed = false;
+
+  const resize = () => {
+    const rect = G.clientRect();
+    const w = Math.max(1, Math.round(rect.width));
+    const h = Math.max(1, Math.round(rect.height));
+    if (!(rect.width > 0) || !(rect.height > 0)) return null;
+    const dpr = Math.min(maxDpr, (typeof devicePixelRatio === 'number' && devicePixelRatio) || 1);
+    renderer.setPixelRatio(dpr);
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    return { w, h, dpr };
+  };
+  const render = () => renderer.render(scene, camera);
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    disposeObject3D(scene);
+    renderer.dispose();
+    if (typeof renderer.forceContextLoss === 'function') renderer.forceContextLoss();
+    const el = renderer.domElement;
+    if (ownsCanvas && el && el.parentNode) el.parentNode.removeChild(el);
+  };
+
+  resize();
+  return { renderer, camera, scene, resize, render, dispose };
+}
+
+/** Pinned face-api build and where its weights live (same CDN path). */
+export const FACE_API_BASE = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15';
+
+const faceApiCache = new Map();
+
+/**
+ * loadFaceApi({ base?, nets? }) — dynamic-import face-api and load the tiny
+ * detector + 68-point tiny landmark nets. Resolves to the `faceapi` namespace.
+ *
+ * One load per `base` per page: concurrent and repeated calls share a promise.
+ * A failed load is evicted so the next call retries. Callers keep their own
+ * try/catch and "tracker unavailable" fallback; this only owns the setup.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.base=FACE_API_BASE]
+ * @param {string[]} [opts.nets=['tinyFaceDetector','faceLandmark68TinyNet']]
+ * @param {(url: string) => Promise<any>} [opts.importer]  Override for tests.
+ */
+export function loadFaceApi({
+  base = FACE_API_BASE,
+  nets = ['tinyFaceDetector', 'faceLandmark68TinyNet'],
+  importer = (url) => import(url),
+} = {}) {
+  const key = base + '|' + nets.join(',');
+  if (!faceApiCache.has(key)) {
+    const p = (async () => {
+      const faceapi = await importer(base + '/dist/face-api.esm.js');
+      await Promise.all(nets.map((n) => faceapi.nets[n].loadFromUri(base + '/model')));
+      return faceapi;
+    })();
+    p.catch(() => faceApiCache.delete(key));
+    faceApiCache.set(key, p);
+  }
+  return faceApiCache.get(key);
+}
+
+/**
+ * tinyFaceOptions(faceapi, inputSize?, scoreThreshold?) — the
+ * `TinyFaceDetectorOptions` every face module builds after loading.
+ */
+export function tinyFaceOptions(faceapi, inputSize = 224, scoreThreshold) {
+  return new faceapi.TinyFaceDetectorOptions(
+    scoreThreshold === undefined ? { inputSize } : { inputSize, scoreThreshold },
+  );
+}
